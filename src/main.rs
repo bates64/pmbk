@@ -103,7 +103,7 @@ pub struct Instrument {
         count = wav_data_length,
         if(wav_data_length > 0 && base != 0)
     )]
-    wav_data: Option<Vec<u8>>,
+    wav_data: Vec<u8>,
 
     loop_predictor: u32, // bank ptr
     loop_start: i32,
@@ -174,7 +174,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             panic!("predictors {:#?} not in predictors block {:#?}", instrument.predictor, predictors_range);
         }
 
-        let pcm = decode_vadpcm(instrument.wav_data.as_ref().unwrap(), &instrument.predictor_data)?;
+        let pcm = decode_vadpcm(&instrument.wav_data, &instrument.predictor_data)?;
 
         // repeat the looping part (TODO: this is probably wrong)
         let mut pcm = pcm.clone();
