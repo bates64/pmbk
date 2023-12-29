@@ -1,4 +1,4 @@
-use binrw::{binrw, FilePtr, PosValue, BinRead, BinWrite};
+use binrw::{binrw, BinRead, BinWrite};
 use binrw::file_ptr::parse_from_iter;
 
 use std::{error::Error, io::Cursor};
@@ -86,7 +86,6 @@ enum Format {
 struct Instrument {
     base: u32, // file ptr
     wav_data_length: u32,
-
     #[br(
         seek_before(SeekFrom::Start(base as u64)),
         restore_position,
@@ -101,8 +100,16 @@ struct Instrument {
     loop_count: i32,
     
     predictor: u32, // bank ptr
-    dc_book_size: u16,
-    key_base: u16,
+    dc_book_size: u16, // in bytes
+    #[br(
+        seek_before(SeekFrom::Start(base as u64)),
+        restore_position,
+        count = dc_book_size as usize / std::mem::size_of::<i16>(),
+        if(predictor != 0)
+    )]
+    predictor_data: Vec<i16>,
+
+    key_base: u16, // pitch stuff
 
     output_rate: i32, // au_swizzle_BK_instruments converts to f32 pitch ratio at runtime by dividing by gSoundGlobals->outputRate
 
@@ -130,27 +137,162 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             println!("{} {:?}", bk.name, bk.size);
 
-            for instrument in bk.instruments {
-                println!("  {:?} {}", instrument.r#type, instrument.output_rate)
+            for (i, instrument) in bk.instruments.iter().enumerate() {
+                println!("  {:?} sample rate {}", instrument.r#type, instrument.output_rate);
+
+                let pcm = decode_vadpcm(instrument.wav_data.as_ref().unwrap(), &instrument.predictor_data)?;
+
+                // write to file
+                // you can load this in audacity with the following settings:
+                // Signed 16-bit PCM
+                // Little-endian
+                // 1 channel (mono)
+                // {instrument.output_rate} Hz
+                let mut file = std::fs::File::create(format!("data/{}_{}.raw16", bk.name, i))?;
+                for sample in pcm {
+                    let sample = sample as i16;
+                    file.write_all(&sample.to_le_bytes())?;
+                }
             }
         }
     }
 
-    /*
-    let data = include_bytes!("../../../pmret/papermario/assets/us/audio/C6_BTL1.bk");
-    let bk: Bk = Bk::read(&mut Cursor::new(data))?;
+    Ok(())
+}
 
-    assert_eq!(bk.size, data.len() as i32, "size mismatch");
+fn readaifccodebook(data: &[i16], order: usize, npredictors: usize) -> Result<Vec<Vec<Vec<i32>>>, Box<dyn Error>> {
+    let mut table = vec![vec![vec![0; order + 8]; 8]; npredictors];
+    let mut pos = 0;
 
-    let instrument = &bk.instruments[0];
+    for i in 0..npredictors {
+        for j in 0..order {
+            for k in 0..8 {
+                table[i][k][j] = data[pos] as i32;
+                pos += 1;
+            }
+        }
 
-    if let Some(wav_data) = &instrument.wav_data {
-        // write wav data to file
-        let mut wav_file = std::fs::File::create("instr.dat")?;
-        wav_file.write_all(wav_data)?;
+        for k in 1..8 {
+            table[i][k][order] = table[i][k - 1][order - 1];
+        }
+
+        table[i][0][order] = 1 << 11;
+
+        for k in 1..8 {
+            for j in 0..k {
+                table[i][j][k + order] = 0;
+            }
+
+            for j in k..8 {
+                table[i][j][k + order] = table[i][j - k][order];
+            }
+        }
     }
-    */
-    
+
+    Ok(table)
+}
+
+fn decode_vadpcm(wave: &Vec<u8>, predictor: &[i16]) -> Result<Vec<i32>, Box<dyn Error>> {
+    let mut cursor = Cursor::new(wave.as_slice());
+    let mut pcm = Vec::new();
+
+    // You can tell how many pages are used by a vadpcm file based on the highest value of the second half of 4 bits on every ninth byte
+    let ninth_byte = wave[8];
+    let pages = ((ninth_byte & 0xF0) >> 4) as usize;
+    dbg!(pages);
+
+    // size = order * pages * 4
+    /*let size = wave.len() / 4;
+    let order = size / pages;
+    dbg!(order);*/
+    let order = 4;
+
+    //let npredictors = predictor.len() / (order * 4);
+    //assert_eq!(pages, npredictors);
+
+    // convert predictor into coef table
+    let coef_table = readaifccodebook(predictor, order, pages)?;
+
+    while cursor.position() + 1 < wave.len() as u64 {
+        let mut data = [0; 16];
+        vdecodeframe(&mut cursor, &mut data, order, &coef_table)?;
+        pcm.extend_from_slice(&data);
+    }
+
+    Ok(pcm)
+}
+
+fn vdecodeframe(ifile: &mut Cursor<&[u8]>, outp: &mut [i32], order: usize, coef_table: &Vec<Vec<Vec<i32>>>) -> Result<(), Box<dyn Error>> {
+    let mut optimalp = 0;
+    let mut scale = 0;
+    let mut maxlevel = 0;
+    let mut j = 0;
+    let mut in_vec = [0; 16];
+    let mut ix = [0; 16];
+    let mut header = [0; 1];
+    let mut c = [0; 1];
+
+    maxlevel = 7;
+    ifile.read_exact(&mut header)?;
+    scale = 1 << (header[0] >> 4);
+    optimalp = header[0] & 0xF;
+
+    let mut i = 0;
+    while i < 16 {
+        ifile.read_exact(&mut c)?;
+        ix[i] = (c[0] >> 4) as i32;
+        ix[i + 1] = (c[0] & 0xF) as i32;
+
+        if ix[i] <= maxlevel {
+            ix[i] *= scale;
+        } else {
+            ix[i] = (-0x10 - -ix[i]) * scale;
+        }
+        
+        if ix[i + 1] <= maxlevel {
+            ix[i + 1] *= scale;
+        } else {
+            ix[i + 1] = (-0x10 - -ix[i + 1]) * scale;
+        }
+
+        i += 2;
+    }
+
+    for j in 0..2 {
+        for i in 0..8 {
+            in_vec[i + order] = ix[j * 8 + i];
+        }
+
+        if j == 0 {
+            for i in 0..order {
+                in_vec[i] = outp[16 - order + i];
+            }
+        } else {
+            for i in 0..order {
+                in_vec[i] = outp[j * 8 - order + i];
+            }
+        }
+
+        for i in 0..8 {
+            outp[i + j * 8] = inner_product(order + 8, &coef_table[optimalp as usize][i], &in_vec);
+        }
+    }
 
     Ok(())
+}
+
+fn inner_product(length: usize, v1: &[i32], v2: &[i32]) -> i32 {
+    let mut out: i32 = 0;
+    for j in 0..length {
+        out = out.overflowing_add(v1[j].overflowing_mul(v2[j]).0).0;
+    }
+
+    // Compute "out / 2^11", rounded down.
+    let dout = out / (1 << 11);
+    let fiout = dout * (1 << 11);
+    if out - fiout < 0 {
+        dout - 1
+    } else {
+        dout
+    }
 }
