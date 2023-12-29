@@ -72,9 +72,16 @@ pub struct Bk {
 
     #[br(
         parse_with = parse_from_iter(instrument_offsets.iter().copied().filter(|&o| o != 0)),
-        seek_before(SeekFrom::Start(0))
+        seek_before(SeekFrom::Start(0)),
+        restore_position,
     )]
     instruments: Vec<Instrument>,
+
+    unk_start_a: u16,
+    unk_size_a: u16,
+
+    predictors_start: u16,
+    predictors_size: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BinRead, BinWrite)]
@@ -104,7 +111,7 @@ struct Instrument {
     predictor: u32, // bank ptr
     dc_book_size: u16, // in bytes
     #[br(
-        seek_before(SeekFrom::Start(base as u64)),
+        seek_before(SeekFrom::Start(predictor as u64)),
         restore_position,
         count = dc_book_size as usize / std::mem::size_of::<i16>(),
         if(predictor != 0)
@@ -139,8 +146,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             println!("{} {:?}", bk.name, bk.size);
 
+            let predictors_range = bk.predictors_start..(bk.predictors_start + bk.predictors_size);
+
             for (i, instrument) in bk.instruments.iter().enumerate() {
                 println!("  {:?} sample rate {} book size {}", instrument.r#type, instrument.output_rate, instrument.dc_book_size);
+
+                // sanity check
+                if !predictors_range.contains(&(instrument.predictor as u16)) {
+                    panic!("predictors {:#?} not in predictors block {:#?}", instrument.predictor, predictors_range);
+                }
 
                 let pcm = decode_vadpcm(instrument.wav_data.as_ref().unwrap(), &instrument.predictor_data)?;
 
@@ -158,7 +172,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 let mut file = std::fs::File::create(format!("data/{}_{}.wav", bk.name, i))?;
                 wav::write(wav::Header::new(wav::header::WAV_FORMAT_PCM, 1, instrument.output_rate as u32, 16), &wav::BitDepth::Sixteen(pcm), &mut file)?;
-
             }
         }
     }
@@ -172,8 +185,11 @@ fn readaifccodebook(data: &[i16], order: usize, npredictors: usize) -> Result<Ve
 
     // pad data
     let required_len = npredictors * order * 8;
-    let mut data = data.to_vec();
-    data.resize(required_len, 0);
+    if required_len != data.len() {
+        panic!("data len {} != required len {}", data.len(), required_len);
+    }
+    //let mut data = data.to_vec();
+    //data.resize(required_len, 0);
     
     for i in 0..npredictors {
         for j in 0..order {
@@ -207,7 +223,6 @@ fn decode_vadpcm(wave: &Vec<u8>, predictor: &[i16]) -> Result<Vec<i16>, Box<dyn 
     let mut cursor = Cursor::new(wave.as_slice());
     let mut pcm = Vec::new();
 
-    /*
     /* You can tell how many pages are used by a vadpcm file based on the highest value of the second half of 4 bits on every ninth byte */
     // iterate over every 9th byte and find the max
     let pages = {
@@ -226,18 +241,9 @@ fn decode_vadpcm(wave: &Vec<u8>, predictor: &[i16]) -> Result<Vec<i16>, Box<dyn 
             }
         }
         cursor.seek(SeekFrom::Start(0))?;
-        max as usize
+        max as usize + 1
     };
-    dbg!(pages);
-
-    // size = order * pages * 4
-    let size = predictor.len() * std::mem::size_of::<i16>();
-    let order = size / (pages * 4);
-    */
-
-    let booksize = predictor.len() * std::mem::size_of::<i16>();
     let order = 2;
-    let pages = booksize / 8;
 
     dbg!(pages, order);
 
