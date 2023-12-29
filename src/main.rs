@@ -7,6 +7,8 @@ use std::io::prelude::*;
 
 use clap::Parser;
 
+mod playback;
+
 /*
 typedef struct BKHeader {
     /* 0x00 */ u16 signature; // 'BK'
@@ -92,7 +94,7 @@ enum Format {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BinRead, BinWrite)]
-struct Instrument {
+pub struct Instrument {
     base: u32, // file ptr
     wav_data_length: u32,
     #[br(
@@ -107,6 +109,13 @@ struct Instrument {
     loop_start: i32,
     loop_end: i32,
     loop_count: i32,
+    #[br(
+        seek_before(SeekFrom::Start(loop_predictor as u64)),
+        restore_position,
+        count = 16,
+        if(loop_predictor != 0)
+    )]
+    loop_predictor_data: Vec<i16>,
     
     predictor: u32, // bank ptr
     dc_book_size: u16, // in bytes
@@ -127,7 +136,7 @@ struct Instrument {
 
 #[derive(Debug, Clone, PartialEq, Eq, BinRead, BinWrite)]
 #[brw(repr = u8)]
-enum InstrumentType {
+pub enum InstrumentType {
     Adpcm, // https://github.com/depp/skelly64/blob/main/docs/docs/vadpcm/codec.md
     Raw16, // uncompressed
 }
@@ -154,12 +163,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     for (i, instrument) in bk.instruments.iter().enumerate() {
         println!("  {:?} sample rate {} book size {}", instrument.r#type, instrument.output_rate, instrument.dc_book_size);
 
+        // loop info
+        if instrument.loop_end != 0 {
+            println!("    loop predictor {:#X}", instrument.loop_predictor);
+            println!("    loop {:X}-{:X} {} times", instrument.loop_start, instrument.loop_end, instrument.loop_count);
+        }
+
         // sanity check
         if !predictors_range.contains(&(instrument.predictor as u16)) {
             panic!("predictors {:#?} not in predictors block {:#?}", instrument.predictor, predictors_range);
         }
 
         let pcm = decode_vadpcm(instrument.wav_data.as_ref().unwrap(), &instrument.predictor_data)?;
+
+        // repeat the looping part (TODO: this is probably wrong)
+        let mut pcm = pcm.clone();
+        let loop_count = if instrument.loop_count == -1 { 100 } else { instrument.loop_count }; // hack
+        for _ in 0..loop_count {
+            let loop_start = instrument.loop_start as usize;
+            let loop_end = instrument.loop_end as usize;
+            let loop_pcm = pcm[loop_start..loop_end].to_vec();
+
+            // insert loop_pcm at loop_start
+            pcm.splice(loop_start..loop_start, loop_pcm.iter().copied());
+        }
 
         // sanity check that all samples arent zero
         let mut all_zero = true;
@@ -172,6 +199,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         if all_zero {
             panic!("all samples are zero");
         }
+
+        playback::play(&instrument, &pcm);
 
         let mut file = std::fs::File::create(format!("data/{}_{}.wav", bk.name, i))?;
         wav::write(wav::Header::new(wav::header::WAV_FORMAT_PCM, 1, instrument.output_rate as u32, 16), &wav::BitDepth::Sixteen(pcm), &mut file)?;
@@ -322,7 +351,7 @@ fn vdecodeframe(ifile: &mut Cursor<&[u8]>, outp: &mut [i32], order: usize, coef_
 fn inner_product(length: usize, v1: &[i32], v2: &[i32]) -> i32 {
     let mut out: i32 = 0;
     for j in 0..length {
-        out = out.overflowing_add(v1[j].overflowing_mul(v2[j]).0).0;
+        out += v1[j] * v2[j];
     }
 
     // Compute "out / 2^11", rounded down.

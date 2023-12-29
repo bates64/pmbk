@@ -6,4 +6,5 @@ edition = "2021"
 [dependencies]
 binrw = "0.13.3"
 clap = { version = "4.4.12", features = ["derive"] }
+rodio = "0.17.3"
 wav = "1.0.0"
