@@ -5,7 +5,7 @@ use std::{error::Error, io::Cursor};
 use std::io::SeekFrom;
 use std::io::prelude::*;
 
-mod vadpcm;
+use clap::Parser;
 
 /*
 typedef struct BKHeader {
@@ -132,48 +132,49 @@ enum InstrumentType {
     Raw16, // uncompressed
 }
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about)]
+/// BK file decoder. Writes decoded instruments to data/NAME_INDEX.wav
+struct Args {
+    /// BK file to read
+    input: String,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    // Open all the .bk files and look for raw16
-    for entry in std::fs::read_dir("../../pmret/papermario/assets/us/audio")? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().unwrap_or_default() == "bk" {
-            //dbg!(path.file_name());
+    let args = Args::parse();
 
-            let file = std::fs::File::open(&path)?;
-            let mut bufreader = std::io::BufReader::new(file);
-            let bk: Bk = Bk::read(&mut bufreader)?;
+    let file = std::fs::File::open(&args.input)?;
+    let mut bufreader = std::io::BufReader::new(file);
+    let bk: Bk = Bk::read(&mut bufreader)?;
 
-            println!("{} {:?}", bk.name, bk.size);
+    println!("{} {:?}", bk.name, bk.size);
 
-            let predictors_range = bk.predictors_start..(bk.predictors_start + bk.predictors_size);
+    let predictors_range = bk.predictors_start..(bk.predictors_start + bk.predictors_size);
 
-            for (i, instrument) in bk.instruments.iter().enumerate() {
-                println!("  {:?} sample rate {} book size {}", instrument.r#type, instrument.output_rate, instrument.dc_book_size);
+    for (i, instrument) in bk.instruments.iter().enumerate() {
+        println!("  {:?} sample rate {} book size {}", instrument.r#type, instrument.output_rate, instrument.dc_book_size);
 
-                // sanity check
-                if !predictors_range.contains(&(instrument.predictor as u16)) {
-                    panic!("predictors {:#?} not in predictors block {:#?}", instrument.predictor, predictors_range);
-                }
+        // sanity check
+        if !predictors_range.contains(&(instrument.predictor as u16)) {
+            panic!("predictors {:#?} not in predictors block {:#?}", instrument.predictor, predictors_range);
+        }
 
-                let pcm = decode_vadpcm(instrument.wav_data.as_ref().unwrap(), &instrument.predictor_data)?;
+        let pcm = decode_vadpcm(instrument.wav_data.as_ref().unwrap(), &instrument.predictor_data)?;
 
-                // sanity check that all samples arent zero
-                let mut all_zero = true;
-                for sample in &pcm {
-                    if *sample != 0 {
-                        all_zero = false;
-                        break;
-                    }
-                }
-                if all_zero {
-                    panic!("all samples are zero");
-                }
-
-                let mut file = std::fs::File::create(format!("data/{}_{}.wav", bk.name, i))?;
-                wav::write(wav::Header::new(wav::header::WAV_FORMAT_PCM, 1, instrument.output_rate as u32, 16), &wav::BitDepth::Sixteen(pcm), &mut file)?;
+        // sanity check that all samples arent zero
+        let mut all_zero = true;
+        for sample in &pcm {
+            if *sample != 0 {
+                all_zero = false;
+                break;
             }
         }
+        if all_zero {
+            panic!("all samples are zero");
+        }
+
+        let mut file = std::fs::File::create(format!("data/{}_{}.wav", bk.name, i))?;
+        wav::write(wav::Header::new(wav::header::WAV_FORMAT_PCM, 1, instrument.output_rate as u32, 16), &wav::BitDepth::Sixteen(pcm), &mut file)?;
     }
 
     Ok(())
