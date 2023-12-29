@@ -5,6 +5,8 @@ use std::{error::Error, io::Cursor};
 use std::io::SeekFrom;
 use std::io::prelude::*;
 
+mod vadpcm;
+
 /*
 typedef struct BKHeader {
     /* 0x00 */ u16 signature; // 'BK'
@@ -138,9 +140,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("{} {:?}", bk.name, bk.size);
 
             for (i, instrument) in bk.instruments.iter().enumerate() {
-                println!("  {:?} sample rate {}", instrument.r#type, instrument.output_rate);
+                println!("  {:?} sample rate {} book size {}", instrument.r#type, instrument.output_rate, instrument.dc_book_size);
 
                 let pcm = decode_vadpcm(instrument.wav_data.as_ref().unwrap(), &instrument.predictor_data)?;
+
+                // sanity check that all samples arent zero
+                let mut all_zero = true;
+                for sample in &pcm {
+                    if *sample != 0 {
+                        all_zero = false;
+                        break;
+                    }
+                }
+                if all_zero {
+                    panic!("all samples are zero");
+                }
 
                 // write to file
                 // you can load this in audacity with the following settings:
@@ -164,6 +178,11 @@ fn readaifccodebook(data: &[i16], order: usize, npredictors: usize) -> Result<Ve
     let mut table = vec![vec![vec![0; order + 8]; 8]; npredictors];
     let mut pos = 0;
 
+    // pad data
+    let required_len = npredictors * order * 8;
+    let mut data = data.to_vec();
+    data.resize(required_len, 0);
+    
     for i in 0..npredictors {
         for j in 0..order {
             for k in 0..8 {
@@ -196,19 +215,39 @@ fn decode_vadpcm(wave: &Vec<u8>, predictor: &[i16]) -> Result<Vec<i32>, Box<dyn 
     let mut cursor = Cursor::new(wave.as_slice());
     let mut pcm = Vec::new();
 
-    // You can tell how many pages are used by a vadpcm file based on the highest value of the second half of 4 bits on every ninth byte
-    let ninth_byte = wave[8];
-    let pages = ((ninth_byte & 0xF0) >> 4) as usize;
+    /*
+    /* You can tell how many pages are used by a vadpcm file based on the highest value of the second half of 4 bits on every ninth byte */
+    // iterate over every 9th byte and find the max
+    let pages = {
+        let mut max = 0;
+        while cursor.position() + 8 < wave.len() as u64 {
+            let mut data = [0; 9];
+            cursor.read_exact(&mut data)?;
+
+            // https://github.com/depp/skelly64/blob/main/docs/docs/vadpcm/codec.md#audio-data-1
+            let control = data[0];
+            let _scale_factor = /* high 4 bits */ (control & 0xF0) >> 4;
+            let predictor_index = /* low 4 bits */ control & 0xF;
+
+            if predictor_index > max {
+                max = predictor_index;
+            }
+        }
+        cursor.seek(SeekFrom::Start(0))?;
+        max as usize
+    };
     dbg!(pages);
 
     // size = order * pages * 4
-    /*let size = wave.len() / 4;
-    let order = size / pages;
-    dbg!(order);*/
-    let order = 4;
+    let size = predictor.len() * std::mem::size_of::<i16>();
+    let order = size / (pages * 4);
+    */
 
-    //let npredictors = predictor.len() / (order * 4);
-    //assert_eq!(pages, npredictors);
+    let booksize = predictor.len() * std::mem::size_of::<i16>();
+    let order = 2;
+    let pages = booksize / 8;
+
+    dbg!(pages, order);
 
     // convert predictor into coef table
     let coef_table = readaifccodebook(predictor, order, pages)?;
@@ -223,19 +262,15 @@ fn decode_vadpcm(wave: &Vec<u8>, predictor: &[i16]) -> Result<Vec<i32>, Box<dyn 
 }
 
 fn vdecodeframe(ifile: &mut Cursor<&[u8]>, outp: &mut [i32], order: usize, coef_table: &Vec<Vec<Vec<i32>>>) -> Result<(), Box<dyn Error>> {
-    let mut optimalp = 0;
-    let mut scale = 0;
-    let mut maxlevel = 0;
-    let mut j = 0;
     let mut in_vec = [0; 16];
     let mut ix = [0; 16];
     let mut header = [0; 1];
     let mut c = [0; 1];
 
-    maxlevel = 7;
+    let maxlevel = 7;
     ifile.read_exact(&mut header)?;
-    scale = 1 << (header[0] >> 4);
-    optimalp = header[0] & 0xF;
+    let scale = 1 << (header[0] >> 4);
+    let optimalp = header[0] & 0xF;
 
     let mut i = 0;
     while i < 16 {
