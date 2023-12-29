@@ -156,17 +156,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     panic!("all samples are zero");
                 }
 
-                // write to file
-                // you can load this in audacity with the following settings:
-                // Signed 16-bit PCM
-                // Little-endian
-                // 1 channel (mono)
-                // {instrument.output_rate} Hz
-                let mut file = std::fs::File::create(format!("data/{}_{}.raw16", bk.name, i))?;
-                for sample in pcm {
-                    let sample = sample as i16;
-                    file.write_all(&sample.to_le_bytes())?;
-                }
+                let mut file = std::fs::File::create(format!("data/{}_{}.wav", bk.name, i))?;
+                wav::write(wav::Header::new(wav::header::WAV_FORMAT_PCM, 1, instrument.output_rate as u32, 16), &wav::BitDepth::Sixteen(pcm), &mut file)?;
+
             }
         }
     }
@@ -211,7 +203,7 @@ fn readaifccodebook(data: &[i16], order: usize, npredictors: usize) -> Result<Ve
     Ok(table)
 }
 
-fn decode_vadpcm(wave: &Vec<u8>, predictor: &[i16]) -> Result<Vec<i32>, Box<dyn Error>> {
+fn decode_vadpcm(wave: &Vec<u8>, predictor: &[i16]) -> Result<Vec<i16>, Box<dyn Error>> {
     let mut cursor = Cursor::new(wave.as_slice());
     let mut pcm = Vec::new();
 
@@ -255,7 +247,11 @@ fn decode_vadpcm(wave: &Vec<u8>, predictor: &[i16]) -> Result<Vec<i32>, Box<dyn 
     while cursor.position() + 1 < wave.len() as u64 {
         let mut data = [0; 16];
         vdecodeframe(&mut cursor, &mut data, order, &coef_table)?;
-        pcm.extend_from_slice(&data);
+
+        // clamp to 16-bit range
+        for i in 0..16 {
+            pcm.push(data[i].clamp(i16::MIN.into(), i16::MAX.into()) as i16);
+        }
     }
 
     Ok(pcm)
