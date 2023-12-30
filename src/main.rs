@@ -388,8 +388,8 @@ fn decode_vadpcm(wave: &Vec<u8>, predictor: &[i16]) -> Result<Vec<i16>, Box<dyn 
     // convert predictor into coef table
     let coef_table = readaifccodebook(predictor, order, pages)?;
 
+    let mut data = [0; 16];
     while cursor.position() + 1 < wave.len() as u64 {
-        let mut data = [0; 16];
         vdecodeframe(&mut cursor, &mut data, order, &coef_table)?;
 
         // clamp to 16-bit range
