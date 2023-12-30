@@ -2,6 +2,7 @@
 name = "pmbk"
 version = "0.1.0"
 edition = "2021"
+description = "Paper Mario (N64) soundbank tool"
 
 [dependencies]
 binrw = "0.13.3"
