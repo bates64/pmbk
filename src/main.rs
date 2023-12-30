@@ -1,4 +1,4 @@
-use binrw::{binrw, BinRead, BinWrite};
+use binrw::{binrw, BinRead, BinWrite, BinResult};
 use binrw::file_ptr::parse_from_iter;
 
 use std::{error::Error, io::Cursor};
@@ -132,6 +132,17 @@ pub struct Instrument {
     output_rate: i32, // au_swizzle_BK_instruments converts to f32 pitch ratio at runtime by dividing by gSoundGlobals->outputRate
 
     r#type: InstrumentType,
+
+    #[br(pad_before = 7)]
+    envelope_offset: u32,
+    #[br(
+        seek_before(SeekFrom::Start(envelope_offset as u64)),
+        restore_position,
+        if(envelope_offset != 0),
+        parse_with = envelope_parser
+    )]
+    #[bw(ignore)]
+    envelope: Envelope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, BinRead, BinWrite)]
@@ -148,6 +159,101 @@ struct Args {
     /// BK file to read
     input: String,
 }
+
+// see au_update_voices
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Envelope {
+    offsets: Vec<EnvelopeOffset>,
+    cmds: Vec<EnvelopeCmd>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BinRead, BinWrite)]
+pub struct EnvelopeOffset {
+    press: u16,
+    release: u16,
+}
+
+impl EnvelopeOffset {
+    pub fn press_cmds<'a>(&self, cmds: &'a[EnvelopeCmd]) -> &'a[EnvelopeCmd] {
+        let start = (self.press / 4) as usize;
+        let mut end = start;
+        for (i, cmd) in cmds[start..].iter().enumerate() {
+            if let EnvelopeCmd::End(_) = cmd {
+                end = start + i;
+                break;
+            }
+        }
+        &cmds[start..end]
+    }
+
+    pub fn release_cmds<'a>(&self, cmds: &'a[EnvelopeCmd]) -> &'a[EnvelopeCmd] {
+        let start = (self.release / 4) as usize;
+        let mut end = start;
+        for (i, cmd) in cmds[start..].iter().enumerate() {
+            if let EnvelopeCmd::End(_) = cmd {
+                end = start + i;
+                break;
+            }
+        }
+        &cmds[start..end]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, BinRead, BinWrite)]
+pub enum EnvelopeCmd {
+    #[br(magic = 0xFBu8)] EndLoop(u8),
+    #[br(magic = 0xFCu8)] StartLoop { count: u8 }, // 0 means infinite
+    #[br(magic = 0xFDu8)] AddMultiplier(u8),
+    #[br(magic = 0xFEu8)] SetMultiplier(u8),
+    #[br(magic = 0xFFu8)] End(u8),
+    ChangeAmplitude {
+        time: u8,  // index into AuEnvelopeIntervals, which are in microseconds
+        amplitude: u8, // target amplitude to fade to
+    },
+}
+
+#[binrw::parser(reader, endian)]
+fn envelope_parser() -> BinResult<Envelope> {
+    let count = u8::read_options(reader, endian, ())?;
+
+    // 3 bytes padding
+    reader.seek(SeekFrom::Current(3))?;
+
+    // EnvelopeOffset x count
+    let mut offsets = Vec::new();
+    let mut max_offset = 0;
+    for _ in 0..count {
+        let offset = EnvelopeOffset::read_options(reader, endian, ())?;
+        if offset.press > max_offset {
+            max_offset = offset.press;
+        }
+        if offset.release > max_offset {
+            max_offset = offset.release;
+        }
+        offsets.push(offset);
+    }
+
+    // read data up until offset=max_offset
+    let mut cmds = Vec::new();
+    for _ in 0..=(max_offset / 4) {
+        cmds.push(EnvelopeCmd::read_options(reader, endian, ())?);
+    }
+    // keep reading until ENV_CMD_END
+    loop {
+        let cmd = EnvelopeCmd::read_options(reader, endian, ())?;
+        if let EnvelopeCmd::End(_) = cmd {
+            cmds.push(cmd);
+            break;
+        }
+        cmds.push(cmd);
+    }
+
+    Ok(Envelope {
+        offsets,
+        cmds,
+    })
+}
+
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
@@ -186,6 +292,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             // insert loop_pcm at loop_start
             pcm.splice(loop_start..loop_start, loop_pcm.iter().copied());
+
+            // TODO: use loop_predictor_data somehow
         }
 
         // sanity check that all samples arent zero
