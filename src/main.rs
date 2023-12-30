@@ -1,9 +1,8 @@
 use binrw::{binrw, BinRead, BinWrite, BinResult};
 use binrw::file_ptr::parse_from_iter;
 
-use std::{error::Error, io::Cursor};
+use std::error::Error;
 use std::io::SeekFrom;
-use std::io::prelude::*;
 
 use clap::Parser;
 
@@ -146,6 +145,12 @@ pub struct Instrument {
     envelope: Envelope,
 }
 
+impl Instrument {
+    pub fn has_loop(&self) -> bool {
+        self.loop_end != 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, BinRead, BinWrite)]
 #[brw(repr = u8)]
 pub enum InstrumentType {
@@ -266,7 +271,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let predictors_range = bk.predictors_start..(bk.predictors_start + bk.predictors_size);
 
-    for (i, instrument) in bk.instruments.iter().enumerate() {
+    for (i, instrument) in bk.instruments.into_iter().enumerate() {
         println!("  {:?} sample rate {} book size {}", instrument.r#type, instrument.output_rate, instrument.dc_book_size);
 
         // loop info
@@ -280,38 +285,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             panic!("predictors {:#?} not in predictors block {:#?}", instrument.predictor, predictors_range);
         }
 
-        let pcm = vadpcm::VadpcmDecoder::new(instrument)?.remaining_samples()?;
+        let sample_rate = instrument.output_rate as u32;
+        let decoder = vadpcm::VadpcmDecoder::new(instrument)?;
 
-        // repeat the looping part (TODO: this is probably wrong)
-        let mut pcm = pcm.clone();
-        let loop_count = if instrument.loop_count == -1 { 100 } else { instrument.loop_count }; // hack
-        for _ in 0..loop_count {
-            let loop_start = instrument.loop_start as usize;
-            let loop_end = instrument.loop_end as usize;
-            let loop_pcm = pcm[loop_start..loop_end].to_vec();
-
-            // insert loop_pcm at loop_start
-            pcm.splice(loop_start..loop_start, loop_pcm.iter().copied());
-
-            // TODO: use loop_predictor_data somehow
-        }
-
-        // sanity check that all samples arent zero
-        let mut all_zero = true;
-        for sample in &pcm {
-            if *sample != 0 {
-                all_zero = false;
-                break;
-            }
-        }
-        if all_zero {
-            panic!("all samples are zero");
-        }
-
-        playback::play(&instrument, &pcm);
-
+        let pcm = decoder.clone().into_iter().collect();
         let mut file = std::fs::File::create(format!("data/{}_{}.wav", bk.name, i))?;
-        wav::write(wav::Header::new(wav::header::WAV_FORMAT_PCM, 1, instrument.output_rate as u32, 16), &wav::BitDepth::Sixteen(pcm), &mut file)?;
+        wav::write(wav::Header::new(wav::header::WAV_FORMAT_IEEE_FLOAT, 1, sample_rate, 32), &wav::BitDepth::ThirtyTwoFloat(pcm), &mut file)?;
+
+        playback::play(decoder);
     }
 
     Ok(())

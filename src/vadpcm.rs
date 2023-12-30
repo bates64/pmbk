@@ -1,31 +1,33 @@
+use std::collections::VecDeque;
 use std::io::prelude::*;
-use std::io::{Cursor, SeekFrom, Result, ErrorKind};
+use std::io::{Cursor, SeekFrom, Result};
+use std::time::Duration;
+use rodio::Source;
 
 use crate::Instrument;
 
-pub struct VadpcmDecoder<'instr> {
-    instrument: &'instr Instrument,
+#[derive(Debug, Clone)]
+pub struct VadpcmDecoder {
+    instrument: Instrument,
     state: [i32; 16],
     codebook: Vec<Vec<Vec<i32>>>,
-    cursor: Cursor<&'instr [u8]>,
+    wav_data_pos: usize,
+    output_buffer: VecDeque<f32>,
 }
 
 /// Hardcoded in ucode.
 const ORDER: usize = 2;
 
-impl<'instr> VadpcmDecoder<'instr> {
-    pub fn new(instrument: &'instr Instrument) -> Result<Self> {
+impl VadpcmDecoder {
+    pub fn new(instrument: Instrument) -> Result<Self> {
         let mut cursor = Cursor::new(instrument.wav_data.as_slice());
 
         // You can tell how many pages are used by a vadpcm file based on the highest value of the second half of 4 bits on every ninth byte
         let pages = {
             let mut max = 0;
-            while cursor.position() + 8 < instrument.wav_data.len() as u64 {
-                let mut data = [0; 9];
-                cursor.read_exact(&mut data)?;
-
+            for i in 0..instrument.wav_data.len() / 9 {
                 // https://github.com/depp/skelly64/blob/main/docs/docs/vadpcm/codec.md#audio-data-1
-                let control = data[0];
+                let control = instrument.wav_data[i * 9];
                 let _scale_factor = /* high 4 bits */ (control & 0xF0) >> 4;
                 let predictor_index = /* low 4 bits */ control & 0xF;
 
@@ -36,6 +38,7 @@ impl<'instr> VadpcmDecoder<'instr> {
             cursor.seek(SeekFrom::Start(0))?;
             max as usize + 1
         };
+        assert!(pages > 0 && pages <= 8); // usually 1 or 2
 
         let codebook = readaifccodebook(&instrument.predictor_data, ORDER, pages)?;
 
@@ -43,42 +46,85 @@ impl<'instr> VadpcmDecoder<'instr> {
             instrument,
             state: [0; 16],
             codebook,
-            cursor,
+            wav_data_pos: 0,
+            output_buffer: VecDeque::new(),
         })
     }
 
     /// Reset back to the start of the file.
-    pub fn reset(&mut self) -> Result<()> {
+    pub fn reset(&mut self) {
         self.state = [0; 16];
-        self.cursor.seek(SeekFrom::Start(0))?;
-        Ok(())
+        self.wav_data_pos = 0;
     }
 
-    /// Decode the next sample.
-    pub fn next_sample(&mut self) -> Result<[i16; 16]> {
-        // TODO: check loop
-
-        vdecodeframe(&mut self.cursor, &mut self.state, ORDER, &self.codebook)?;
-
-        // clamp to 16-bit range
-        let mut pcm = [0; 16];
-        for i in 0..16 {
-            pcm[i] = self.state[i].clamp(i16::MIN.into(), i16::MAX.into()) as i16;
-        }
-        Ok(pcm)
+    pub fn is_complete(&self) -> bool {
+        self.wav_data_pos >= self.instrument.wav_data.len()
     }
 
-    /// Decode all remaining samples until EOF.
-    pub fn remaining_samples(&mut self) -> Result<Vec<i16>> {
-        let mut samples = Vec::new();
-        loop {
-            match self.next_sample() {
-                Ok(pcm) => samples.extend_from_slice(&pcm),
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            }
+    fn decode_frame(&mut self) {
+        if self.is_complete() {
+            self.output_buffer.push_back(0.0);
+            return;
         }
-        Ok(samples)
+
+        let frame = &self.instrument.wav_data[self.wav_data_pos..];
+        vdecodeframe(frame, &mut self.state, ORDER, &self.codebook);
+        self.wav_data_pos += 9;
+
+        for sample in self.state.iter().copied() {
+            // normalize to -1.0..1.0
+            self.output_buffer.push_back(sample as f32 / i16::MAX as f32);
+        }
+    }
+
+    fn decompressed_data_len(&self) -> usize {
+        // each 9 bytes of wav_data become 16 bytes of decompressed data
+        self.instrument.wav_data.len() * 16 / 9
+    }
+}
+
+impl Iterator for VadpcmDecoder {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_complete() {
+            return None;
+        }
+        if self.output_buffer.is_empty() {
+            self.decode_frame();
+        }
+        self.output_buffer.pop_front()
+    }
+}
+
+impl Source for VadpcmDecoder {
+    fn current_frame_len(&self) -> Option<usize> {
+        // channels and sample rate are fixed
+        None
+    }
+
+    fn channels(&self) -> u16 {
+        1
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.instrument.output_rate as u32
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        if self.instrument.has_loop() {
+            None
+        } else {
+            // TODO: check this is correct
+            let duration_ns = 1_000_000_000u64.checked_mul(self.decompressed_data_len() as u64).unwrap()
+                / self.sample_rate() as u64
+                / self.channels() as u64;
+            let duration = Duration::new(
+                duration_ns / 1_000_000_000,
+                (duration_ns % 1_000_000_000) as u32,
+            );
+            Some(duration)
+        }
     }
 }
 
@@ -127,26 +173,24 @@ fn readaifccodebook(
 }
 
 fn vdecodeframe(
-    ifile: &mut Cursor<&[u8]>,
+    frame: &[u8], // should be 9 bytes
     outp: &mut [i32],
     order: usize,
     coef_table: &Vec<Vec<Vec<i32>>>,
-) -> Result<()> {
+) {
     let mut in_vec = [0; 16];
     let mut ix = [0; 16];
-    let mut header = [0; 1];
-    let mut c = [0; 1];
 
     let maxlevel = 7;
-    ifile.read_exact(&mut header)?;
-    let scale = 1 << (header[0] >> 4);
-    let optimalp = header[0] & 0xF;
+    let header = frame[0];
+    let scale = 1 << (header >> 4);
+    let optimalp = header & 0xF;
 
     let mut i = 0;
     while i < 16 {
-        ifile.read_exact(&mut c)?;
-        ix[i] = (c[0] >> 4) as i32;
-        ix[i + 1] = (c[0] & 0xF) as i32;
+        let c = frame.get(i / 2 + 1).copied().unwrap_or(0);
+        ix[i] = (c >> 4) as i32;
+        ix[i + 1] = (c & 0xF) as i32;
 
         if ix[i] <= maxlevel {
             ix[i] *= scale;
@@ -182,8 +226,6 @@ fn vdecodeframe(
             outp[i + j * 8] = inner_product(order + 8, &coef_table[optimalp as usize][i], &in_vec);
         }
     }
-
-    Ok(())
 }
 
 fn inner_product(length: usize, v1: &[i32], v2: &[i32]) -> i32 {

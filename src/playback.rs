@@ -1,11 +1,14 @@
 use rodio::{OutputStream, source::Source};
-use rodio::buffer::SamplesBuffer;
 
-use crate::Instrument;
+use crate::vadpcm::VadpcmDecoder;
 
-pub fn play(instrument: &Instrument, pcm: &[i16]) {
+pub fn play(decoder: VadpcmDecoder) {
+    let duration: Option<std::time::Duration> = decoder.total_duration();
+
     let (_stream, stream_handle) = OutputStream::try_default().unwrap();
-    let source = SamplesBuffer::new(1, instrument.output_rate as u32, pcm);
-    stream_handle.play_raw(source.convert_samples()).unwrap();
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    stream_handle.play_raw(decoder).unwrap();
+    std::thread::sleep(match duration {
+        Some(duration) => duration,
+        None => std::time::Duration::from_secs(2),
+    });
 }
