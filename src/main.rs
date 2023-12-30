@@ -7,6 +7,8 @@ use std::io::SeekFrom;
 use clap::Parser;
 
 mod vadpcm;
+
+#[cfg(feature = "rodio")]
 mod playback;
 
 /*
@@ -292,6 +294,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut file = std::fs::File::create(format!("data/{}_{}.wav", bk.name, i))?;
         wav::write(wav::Header::new(wav::header::WAV_FORMAT_IEEE_FLOAT, 1, sample_rate, 32), &wav::BitDepth::ThirtyTwoFloat(pcm), &mut file)?;
 
+        #[cfg(feature = "rodio")]
         playback::play(decoder);
     }
 

@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 use std::io::prelude::*;
 use std::io::{Cursor, SeekFrom, Result};
-use std::time::Duration;
+
+#[cfg(feature = "rodio")]
 use rodio::Source;
 
 use crate::Instrument;
@@ -97,6 +98,7 @@ impl Iterator for VadpcmDecoder {
     }
 }
 
+#[cfg(feature = "rodio")]
 impl Source for VadpcmDecoder {
     fn current_frame_len(&self) -> Option<usize> {
         // channels and sample rate are fixed
@@ -111,7 +113,7 @@ impl Source for VadpcmDecoder {
         self.instrument.output_rate as u32
     }
 
-    fn total_duration(&self) -> Option<Duration> {
+    fn total_duration(&self) -> Option<std::time::Duration> {
         if self.instrument.has_loop() {
             None
         } else {
@@ -119,7 +121,7 @@ impl Source for VadpcmDecoder {
             let duration_ns = 1_000_000_000u64.checked_mul(self.decompressed_data_len() as u64).unwrap()
                 / self.sample_rate() as u64
                 / self.channels() as u64;
-            let duration = Duration::new(
+            let duration = std::time::Duration::new(
                 duration_ns / 1_000_000_000,
                 (duration_ns % 1_000_000_000) as u32,
             );
