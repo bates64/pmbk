@@ -1,7 +1,10 @@
 use binrw::file_ptr::parse_from_iter;
+use binrw::io::BufReader;
 use binrw::{binrw, BinRead, BinResult, BinWrite};
 
+use std::fs::File;
 use std::io::{self, SeekFrom};
+use std::path::Path;
 
 pub mod vadpcm;
 
@@ -11,7 +14,7 @@ pub mod playback;
 #[binrw]
 #[brw(big, magic = b"BK  ")]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Bk {
+pub struct Bank {
     size: i32,
 
     #[br(map = |x: [u8; 4]| String::from_utf8_lossy(&x).to_string())]
@@ -30,6 +33,9 @@ pub struct Bk {
     predictors_start: u16,
     predictors_size: u16,
 
+    unk_start_b: u16,
+    unk_size_b: u16,
+
     #[br(
         parse_with = parse_from_iter(instrument_offsets.iter().copied().filter(|&o| o != 0)),
         seek_before(SeekFrom::Start(0)),
@@ -38,7 +44,20 @@ pub struct Bk {
     instruments: Vec<Instrument>,
 }
 
-impl Bk {
+impl Bank {
+    pub fn open<P: AsRef<Path>>(path: P) -> BinResult<Self> {
+        Self::read(&mut BufReader::new(File::open(path)?))
+    }
+
+    pub fn read<R: io::Read + io::Seek>(reader: &mut R) -> BinResult<Self> {
+        Self::read_be(reader)
+    }
+
+    pub fn write<W: io::Write + io::Seek>(&self, writer: &mut W) -> BinResult<()> {
+        // TODO: fix size, relocs, etc
+        self.write_be(writer)
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }

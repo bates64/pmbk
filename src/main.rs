@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let file = std::fs::File::open(&args.input)?;
     let mut bufreader = std::io::BufReader::new(file);
-    let bk: Bk = Bk::read(&mut bufreader)?;
+    let bk: Bank = Bank::read(&mut bufreader)?;
 
     for (i, instrument) in bk.instruments().iter().enumerate() {
         #[cfg(feature = "wav")]
