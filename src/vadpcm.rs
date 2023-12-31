@@ -1,6 +1,4 @@
 use std::collections::VecDeque;
-use std::io::prelude::*;
-use std::io::{Cursor, SeekFrom, Result};
 
 #[cfg(feature = "rodio")]
 use rodio::Source;
@@ -9,7 +7,7 @@ use crate::Instrument;
 
 #[derive(Debug, Clone)]
 pub struct VadpcmDecoder {
-    instrument: Instrument,
+    instrument: Instrument, // TODO: reference, but this will break rodio::Source impl
     state: [i32; 16],
     codebook: Vec<Vec<Vec<i32>>>,
     wav_data_pos: usize,
@@ -20,9 +18,7 @@ pub struct VadpcmDecoder {
 const ORDER: usize = 2;
 
 impl VadpcmDecoder {
-    pub fn new(instrument: Instrument) -> Result<Self> {
-        let mut cursor = Cursor::new(instrument.wav_data.as_slice());
-
+    pub fn new(instrument: Instrument) -> Self {
         // You can tell how many pages are used by a vadpcm file based on the highest value of the second half of 4 bits on every ninth byte
         let pages = {
             let mut max = 0;
@@ -36,20 +32,19 @@ impl VadpcmDecoder {
                     max = predictor_index;
                 }
             }
-            cursor.seek(SeekFrom::Start(0))?;
             max as usize + 1
         };
         assert!(pages > 0 && pages <= 8); // usually 1 or 2
 
-        let codebook = readaifccodebook(&instrument.predictor_data, ORDER, pages)?;
+        let codebook = readaifccodebook(&instrument.predictor_data, ORDER, pages);
 
-        Ok(Self {
+        Self {
             instrument,
             state: [0; 16],
             codebook,
             wav_data_pos: 0,
             output_buffer: VecDeque::new(),
-        })
+        }
     }
 
     /// Reset back to the start of the file.
@@ -74,7 +69,8 @@ impl VadpcmDecoder {
 
         for sample in self.state.iter().copied() {
             // normalize to -1.0..1.0
-            self.output_buffer.push_back(sample as f32 / i16::MAX as f32);
+            self.output_buffer
+                .push_back(sample as f32 / i16::MAX as f32);
         }
     }
 
@@ -118,7 +114,9 @@ impl Source for VadpcmDecoder {
             None
         } else {
             // TODO: check this is correct
-            let duration_ns = 1_000_000_000u64.checked_mul(self.decompressed_data_len() as u64).unwrap()
+            let duration_ns = 1_000_000_000u64
+                .checked_mul(self.decompressed_data_len() as u64)
+                .unwrap()
                 / self.sample_rate() as u64
                 / self.channels() as u64;
             let duration = std::time::Duration::new(
@@ -130,11 +128,7 @@ impl Source for VadpcmDecoder {
     }
 }
 
-fn readaifccodebook(
-    data: &[i16],
-    order: usize,
-    npredictors: usize,
-) -> Result<Vec<Vec<Vec<i32>>>> {
+fn readaifccodebook(data: &[i16], order: usize, npredictors: usize) -> Vec<Vec<Vec<i32>>> {
     let mut table = vec![vec![vec![0; order + 8]; 8]; npredictors];
     let mut pos = 0;
 
@@ -171,7 +165,7 @@ fn readaifccodebook(
         }
     }
 
-    Ok(table)
+    table
 }
 
 fn vdecodeframe(

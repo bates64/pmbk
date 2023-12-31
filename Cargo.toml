@@ -8,4 +8,7 @@ description = "Paper Mario (N64) soundbank tool"
 binrw = "0.13.3"
 clap = { version = "4.4.12", features = ["derive"] }
 rodio = { version = "0.17.3", optional = true }
-wav = "1.0.0"
+wav = { version = "1.0.0", optional = true }
+
+[features]
+default = ["rodio", "wav"]
